@@ -10,7 +10,7 @@ It implements multiple algorithms like Token Bucket, Leaky Bucket, and Sliding W
 
 ## 🧩 Folder Structure
 rate-limiter/
-├─ cmd/demo/ # Demo program to run examples
+├─ cmd/
 ├─ internal/limiter/ # Core limiter algorithms
 ├─ internal/store/ # Storage interface and in-memory implementation
 ├─ internal/manager/ # Manages limiters per key/config
