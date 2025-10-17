@@ -31,11 +31,11 @@ make run      # run demo app
 
 ## 🧠 Concepts Covered
 
-Concurrency and synchronization
+- Concurrency and synchronization
 
-Advanced Go patterns
+- Advanced Go patterns
 
-Clean architecture and separation of concerns
+- Clean architecture and separation of concerns
 
 
 ---
