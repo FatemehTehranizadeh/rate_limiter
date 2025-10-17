@@ -26,9 +26,10 @@ rate-limiter/
 make test     # run tests
 make lint     # run static analysis
 make run      # run demo app
+```
 
 
-🧠 Concepts Covered
+## 🧠 Concepts Covered
 
 Concurrency and synchronization
 
@@ -46,3 +47,4 @@ go mod tidy
 make fmt
 make lint
 make test
+```
