@@ -22,6 +22,6 @@ type Stats struct {
 
 type Reservation interface {
 	OK() bool
-	Cancel()
+	Cancel() 
 	Delay() time.Duration // how long caller should wait before proceeding
 }
