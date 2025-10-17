@@ -12,12 +12,14 @@ type LeakyBucketLimiter struct {
 	rate     float64
 	capacity int64
 	lastLeak time.Time
-	tokens int64
+	tokens   int64
+	requests chan struct{}
 	store    Store
 	mu       sync.Mutex
 	cond     *sync.Cond // used to block Waiters when no tokens present (or per-key conds)
 	once     sync.Once  // one-time initialization (e.g., starting refill goroutine)
 	pool     *sync.Pool // reuse Reservation objects or small buffers
+	stopCh   chan struct{}
 }
 
 func (lbl *LeakyBucketLimiter) Allow(ctx context.Context, key string) bool {
@@ -27,7 +29,7 @@ func (lbl *LeakyBucketLimiter) Allow(ctx context.Context, key string) bool {
 	default:
 		lbl.mu.Lock()
 		defer lbl.mu.Unlock()
-		if lbl.capacity > 0 {
+		if lbl.capacity > 0 && lbl.tokens <= lbl.capacity {
 			lbl.capacity--
 			return true
 		}
@@ -36,31 +38,45 @@ func (lbl *LeakyBucketLimiter) Allow(ctx context.Context, key string) bool {
 }
 
 func (lbl *LeakyBucketLimiter) TryAcquire(key string, n int64) bool { //pick n tokens up
-	if n <= lbl.capacity {
+	if n <= lbl.tokens && lbl.tokens <= lbl.capacity {
 		lbl.mu.Lock()
 		defer lbl.mu.Unlock()
-		lbl.capacity -= n
+		lbl.tokens -= n
 		return true
 	}
 	return false
 }
 
-func (lbl *TokenBucketLimiter) Reserve(ctx context.Context, key string) (Reservation, bool) {
+func (lbl *LeakyBucketLimiter) Reserve(ctx context.Context, key string) (Reservation, bool) {
 	select {
 	case <-ctx.Done():
 		fmt.Println("Request timeout.")
-		return nil, false
+		res := &tokenReservation{
+			ok: false,
+			cancel: func() {
+				fmt.Println("The request can not be handled right now.")
+			},
+		}
+		return res, false
 	default:
 		lbl.mu.Lock()
 		defer lbl.mu.Unlock()
-		if lbl.capacity == 0 {
-			lbl.cond.Wait()
+		if lbl.tokens > 0 && lbl.tokens <= lbl.capacity {
+			lbl.tokens--
+			res := &tokenReservation{
+				ok:    true,
+				delay: 0,
+			}
+			return res, true
+		} else {
+			waitingTime := time.Duration(float64(1 / lbl.rate))
+			res := &tokenReservation{
+				ok:    true,
+				delay: waitingTime,
+			}
+			return res, true
 		}
-		lbl.capacity --
-		fmt.Println("The request allows!")
 	}
-	return nil
-
 }
 
 func (lbl *LeakyBucketLimiter) Wait(ctx context.Context, key string) error { //block until token available using Cond or channel
@@ -71,27 +87,37 @@ func (lbl *LeakyBucketLimiter) Wait(ctx context.Context, key string) error { //b
 	default:
 		lbl.mu.Lock()
 		defer lbl.mu.Unlock()
-		if lbl.capacity == 0 {
+		for lbl.tokens == 0 {
 			lbl.cond.Wait()
 		}
-		lbl.capacity --
+		lbl.tokens--
 		fmt.Println("The request allows!")
-		return nil	
+		return nil
 	}
-	return nil
 }
 
 func (lbl *LeakyBucketLimiter) Refill() { //background goroutine to periodically refill tokens
-	lbl.mu.Lock()
-	defer lbl.mu.Unlock()
-	leakRate := time.Duration(math.Round(lbl.rate))
-	now := time.Now()
-	elapsedTime := now.Sub(lbl.lastLeak)
-	if elapsedTime >= leakRate {
-		lbl.capacity += int64(lbl.rate)
-		lbl.cond.Signal()
-	}
-	lbl.lastLeak = lbl.lastLeak.Add(leakRate)	
+	lbl.once.Do(func() {
+		go func() {
+			ticker := time.NewTicker(time.Second / time.Duration(lbl.rate))
+			defer ticker.Stop()
+			select {
+			case <-lbl.stopCh:
+				close(lbl.stopCh)
+			case <-ticker.C:
+				lbl.mu.Lock()
+				leakRate := time.Duration(math.Round(lbl.rate))
+				now := time.Now()
+				elapsedTime := now.Sub(lbl.lastLeak)
+				if elapsedTime >= leakRate {
+					lbl.tokens += int64(lbl.rate)
+					lbl.cond.Broadcast()
+				}
+				lbl.lastLeak = lbl.lastLeak.Add(leakRate)
+				lbl.mu.Unlock()
+			}
+		}()
+	})
 
 }
 
@@ -100,5 +126,9 @@ func (lbl *LeakyBucketLimiter) Stats(key string) Stats { //uses store to read co
 }
 
 func (lbl *LeakyBucketLimiter) Close() { //stop refill goroutine, broadcast cond.
-
+	_, ok := <-lbl.stopCh
+	if ok {
+		close(lbl.stopCh)
+	}
+	lbl.cond.Broadcast()
 }

@@ -3,20 +3,54 @@ package internal
 import (
 	"context"
 	"fmt"
-	"math"
 	"sync"
 	"time"
 )
 
 type TokenBucketLimiter struct {
-	rate     float64 //tokens per second
-	capacity int64
-	tokens   int64
-	store    Store
-	mu       sync.Mutex
-	cond     *sync.Cond // used to block Waiters when no tokens present (or per-key conds)
-	once     sync.Once  // one-time initialization (e.g., starting refill goroutine)
-	pool     *sync.Pool // reuse Reservation objects or small buffers
+	rate      float64 // tokens per second
+	capacity  int64
+	tokens    int64
+	store     Store
+	mu        sync.Mutex
+	cond      *sync.Cond    // used to block Waiters when no tokens present (or per-key conds)
+	once      sync.Once     // one-time initialization (e.g., starting refill goroutine)
+	pool      *sync.Pool    // reuse Reservation objects or small buffers
+	stopCh    chan struct{} // signal to stop refill goroutine
+	refillDur time.Duration
+}
+
+type tokenReservation struct {
+	ok     bool
+	delay  time.Duration
+	cancel func()
+}
+
+func (r *tokenReservation) OK() bool {
+	return r.ok
+}
+
+func (r *tokenReservation) Delay() time.Duration {
+	return r.delay
+}
+
+func (r *tokenReservation) Cancel() {
+	if r.cancel != nil {
+		r.cancel()
+	}
+}
+
+func NewTokenBucketLimiter(rate float64, capacity int64) *TokenBucketLimiter {
+	tbl := &TokenBucketLimiter{
+		rate:      rate,
+		capacity:  capacity,
+		tokens:    capacity,
+		stopCh:    make(chan struct{}),
+		refillDur: time.Second,
+	}
+	tbl.cond = sync.NewCond(&tbl.mu)
+	tbl.Refill()
+	return tbl
 }
 
 func (tbl *TokenBucketLimiter) Allow(ctx context.Context, key string) bool {
@@ -27,7 +61,7 @@ func (tbl *TokenBucketLimiter) Allow(ctx context.Context, key string) bool {
 		tbl.mu.Lock()
 		defer tbl.mu.Unlock()
 		if tbl.capacity > 0 {
-			tbl.capacity--
+			tbl.tokens--
 			return true
 		}
 	}
@@ -35,10 +69,10 @@ func (tbl *TokenBucketLimiter) Allow(ctx context.Context, key string) bool {
 }
 
 func (tbl *TokenBucketLimiter) TryAcquire(key string, n int64) bool { //pick n tokens up
-	if n <= tbl.capacity {
-		tbl.mu.Lock()
-		defer tbl.mu.Unlock()
-		tbl.capacity -= n
+	tbl.mu.Lock()
+	defer tbl.mu.Unlock()
+	if n <= tbl.tokens && tbl.tokens <= tbl.capacity {
+		tbl.tokens -= n
 		return true
 	}
 	return false
@@ -48,17 +82,35 @@ func (tbl *TokenBucketLimiter) Reserve(ctx context.Context, key string) (Reserva
 	select {
 	case <-ctx.Done():
 		fmt.Println("Request timeout.")
-		return
+		res := &tokenReservation{
+			ok: false,
+			cancel: func() {
+				fmt.Println("The request can not be handled right now.")
+			},
+		}
+		return res, false
 	default:
 		tbl.mu.Lock()
 		defer tbl.mu.Unlock()
-		if tbl.capacity == 0 {
-			tbl.cond.Wait()
+		if tbl.tokens > 0 {
+			tbl.tokens--
+			res := &tokenReservation{
+				ok:    true,
+				delay: 0,
+			}
+			return res, true
+		} else {
+			waitingTime := time.Duration(float64(float64(time.Second) / tbl.rate))
+			res := &tokenReservation{
+				ok:    true,
+				delay: waitingTime,
+				cancel: func() {
+					fmt.Println("Reservation cancelled.")
+				},
+			}
+			return res, true
 		}
-		tbl.capacity--
-		fmt.Println("The request allows!")
 	}
-	return nil
 
 }
 
@@ -69,28 +121,32 @@ func (tbl *TokenBucketLimiter) Wait(ctx context.Context, key string) error { //b
 		return ctx.Err()
 	default:
 		tbl.mu.Lock()
-		tbl.mu.Unlock()
-		if tbl.capacity == 0 {
+		defer tbl.mu.Unlock()
+		for tbl.tokens == 0 {
 			tbl.cond.Wait()
 		}
-		tbl.capacity = -1
+		tbl.tokens--
 		fmt.Println("The request allows!")
 	}
 	return nil
 }
 
 func (tbl *TokenBucketLimiter) Refill() { //background goroutine to periodically refill tokens
-	ticker := time.NewTicker(time.Duration(math.Round(tbl.rate)))
-	defer ticker.Stop()
-	tbl.mu.Lock()
-	defer tbl.mu.Unlock()
-	for {
-		select {
-		case <-ticker.C:
-			tbl.capacity += int64(tbl.rate)
-			tbl.cond.Signal()
-		}
-	}
+	tbl.once.Do(func() {
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			select {
+			case <-tbl.stopCh:
+				close(tbl.stopCh)
+			case <-ticker.C:
+				tbl.mu.Lock()
+				tbl.tokens = min(tbl.capacity, tbl.tokens+int64(tbl.rate))
+				tbl.mu.Unlock()
+				tbl.cond.Broadcast()
+			}
+		}()
+	})
 }
 
 func (tbl *TokenBucketLimiter) Stats(key string) Stats { //uses store to read counters
@@ -98,5 +154,9 @@ func (tbl *TokenBucketLimiter) Stats(key string) Stats { //uses store to read co
 }
 
 func (tbl *TokenBucketLimiter) Close() { //stop refill goroutine, broadcast cond.
-
+	_, ok := <-tbl.stopCh 
+	if ok {
+		close(tbl.stopCh)
+	}
+	tbl.cond.Broadcast()
 }
