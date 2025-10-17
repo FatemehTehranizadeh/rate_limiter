@@ -1,11 +1,19 @@
-.PHONY: test vet lint
-
+# Run all tests
 test:
-  go test ./...
+	go test ./... -v
 
-vet:
-  go vet ./...
+# Run race detector
+race:
+	go test ./... -race -v
 
+# Run linter
 lint:
-  golangci-lint run
+	golangci-lint run
 
+# Format code
+fmt:
+	go fmt ./...
+
+# Run demo app
+run:
+	go run ./cmd/demo
