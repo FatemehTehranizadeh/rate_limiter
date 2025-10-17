@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-type TokenBucketLimiter struct {
+type SlidingWindowLimiter struct {
 	window   time.Duration
 	capacity int64
 	store    Store
@@ -16,27 +16,26 @@ type TokenBucketLimiter struct {
 	pool     *sync.Pool // reuse Reservation objects or small buffers
 }
 
-func (tbl *TokenBucketLimiter) Allow(ctx context.Context, key string) bool {
+func (tbl *SlidingWindowLimiter) Allow(ctx context.Context, key string) bool {
 	return true
 }
 
-func (tbl *TokenBucketLimiter) TryAcquire(key string, n int) bool { //pick n tokens up
+func (tbl *SlidingWindowLimiter) TryAcquire(key string, n int) bool { //pick n tokens up
 	return true
 }
 
-func (tbl *TokenBucketLimiter) Wait(ctx context.Context, key string) error { //block until token available using Cond or channel
+func (tbl *SlidingWindowLimiter) Wait(ctx context.Context, key string) error { //block until token available using Cond or channel
 	return ctx.Err()
 }
 
-func (tbl *TokenBucketLimiter) Refill() { //background goroutine to periodically refill tokens
-	
+func (tbl *SlidingWindowLimiter) Refill() { //background goroutine to periodically refill tokens
+
 }
 
-func (tbl *TokenBucketLimiter) Stats(key string) Stats { //uses store to read counters
+func (tbl *SlidingWindowLimiter) Stats(key string) Stats { //uses store to read counters
 	return Stats{}
 }
 
-func (tbl *TokenBucketLimiter) Close() { //stop refill goroutine, broadcast cond.
-	
-}
+func (tbl *SlidingWindowLimiter) Close() { //stop refill goroutine, broadcast cond.
 
+}
