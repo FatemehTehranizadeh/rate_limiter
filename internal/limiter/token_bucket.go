@@ -11,6 +11,7 @@ type TokenBucketLimiter struct {
 	rate      float64 // tokens per second
 	capacity  int64
 	tokens    int64
+	acc       float64
 	store     Store
 	mu        sync.Mutex
 	cond      *sync.Cond    // used to block Waiters when no tokens present (or per-key conds)
@@ -18,6 +19,7 @@ type TokenBucketLimiter struct {
 	pool      *sync.Pool    // reuse Reservation objects or small buffers
 	stopCh    chan struct{} // signal to stop refill goroutine
 	refillDur time.Duration
+	closed    bool
 }
 
 type tokenReservation struct {
@@ -91,59 +93,92 @@ func (tbl *TokenBucketLimiter) Reserve(ctx context.Context, key string) (Reserva
 		return res, false
 	default:
 		tbl.mu.Lock()
-		defer tbl.mu.Unlock()
 		if tbl.tokens > 0 {
 			tbl.tokens--
+			tbl.mu.Unlock()
 			res := &tokenReservation{
 				ok:    true,
 				delay: 0,
 			}
 			return res, true
-		} else {
-			waitingTime := time.Duration(float64(float64(time.Second) / tbl.rate))
-			res := &tokenReservation{
-				ok:    true,
-				delay: waitingTime,
-				cancel: func() {
-					fmt.Println("Reservation cancelled.")
-				},
-			}
-			return res, true
 		}
+		if tbl.rate <= 0 {
+			tbl.mu.Unlock()
+			return nil, false
+		}
+		remainingTokens := 1.0 - tbl.acc // We need 1 token to satisfy the request, So we check how many tokens are remaining to get that 1 token
+		if remainingTokens < 0 {
+			remainingTokens = 0
+		}
+		waitDur := time.Duration(remainingTokens * float64(tbl.refillDur))
+		tbl.mu.Unlock()
+
+		res := &tokenReservation{
+			ok:    true,
+			delay: waitDur,
+			cancel: func() {
+				fmt.Println("The request has been cancelled.")
+			},
+		}
+		return res, true
 	}
 
 }
 
 func (tbl *TokenBucketLimiter) Wait(ctx context.Context, key string) error { //block until token available using Cond or channel
-	select {
-	case <-ctx.Done():
-		fmt.Println("Request timeout.")
-		return ctx.Err()
-	default:
-		tbl.mu.Lock()
-		defer tbl.mu.Unlock()
-		for tbl.tokens == 0 {
-			tbl.cond.Wait()
+	// ensure Wait is interruptible by context: broadcast on ctx.Done()
+	doneCh := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			tbl.cond.Broadcast()
+		case <-doneCh:
+			// normal path
 		}
-		tbl.tokens--
-		fmt.Println("The request allows!")
+	}()
+
+	tbl.mu.Lock()
+	defer func() {
+		tbl.mu.Unlock()
+		close(doneCh)
+	}()
+
+	for tbl.tokens == 0 {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		tbl.cond.Wait()
 	}
+
+	tbl.tokens--
 	return nil
 }
 
 func (tbl *TokenBucketLimiter) Refill() { //background goroutine to periodically refill tokens
 	tbl.once.Do(func() {
 		go func() {
-			ticker := time.NewTicker(time.Second)
+			ticker := time.NewTicker(tbl.refillDur)
 			defer ticker.Stop()
-			select {
-			case <-tbl.stopCh:
-				close(tbl.stopCh)
-			case <-ticker.C:
-				tbl.mu.Lock()
-				tbl.tokens = min(tbl.capacity, tbl.tokens+int64(tbl.rate))
-				tbl.mu.Unlock()
-				tbl.cond.Broadcast()
+			for {
+				select {
+				case <-tbl.stopCh:
+					return
+				case <-ticker.C:
+					tbl.mu.Lock()
+					// accumulate fractional tokens
+					tbl.acc += tbl.rate * (float64(tbl.refillDur) / float64(time.Second))
+					add := int64(tbl.acc)
+					if add > 0 {
+						if tbl.tokens+add > tbl.capacity {
+							tbl.tokens = tbl.capacity
+						} else {
+							tbl.tokens += add
+						}
+						tbl.acc -= float64(add)
+						tbl.cond.Broadcast()
+					}
+					tbl.mu.Unlock()
+				}
 			}
 		}()
 	})
@@ -153,10 +188,15 @@ func (tbl *TokenBucketLimiter) Stats(key string) Stats { //uses store to read co
 	return Stats{}
 }
 
-func (tbl *TokenBucketLimiter) Close() { //stop refill goroutine, broadcast cond.
-	_, ok := <-tbl.stopCh 
-	if ok {
-		close(tbl.stopCh)
+func (tbl *TokenBucketLimiter) Close() error { //stop refill goroutine, broadcast cond.
+	tbl.mu.Lock()
+	if tbl.closed {
+		tbl.mu.Unlock()
+		return nil
 	}
+	tbl.closed = true
+	close(tbl.stopCh)
 	tbl.cond.Broadcast()
+	tbl.mu.Unlock()
+	return nil
 }
