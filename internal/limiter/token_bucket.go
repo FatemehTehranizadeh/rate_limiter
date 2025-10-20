@@ -2,26 +2,26 @@ package internal
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 )
 
 type TokenBucketLimiter struct {
 	rate      float64 // tokens per second
-	capacity  int64
-	tokens    int64
-	acc       float64
+	capacity  int64   // How much the bucket can hold
+	tokens    int64   // current number of tokens
+	acc       float64 // fractional token accumulator
 	store     Store
 	mu        sync.Mutex
 	cond      *sync.Cond    // used to block Waiters when no tokens present (or per-key conds)
 	once      sync.Once     // one-time initialization (e.g., starting refill goroutine)
 	pool      *sync.Pool    // reuse Reservation objects or small buffers
 	stopCh    chan struct{} // signal to stop refill goroutine
-	refillDur time.Duration
-	closed    bool
+	refillDur time.Duration // duration between refills
+	closed    bool          // whether limiter is closed
 }
 
+// The status of reservations and acquisitions.
 type tokenReservation struct {
 	ok     bool
 	delay  time.Duration
@@ -42,6 +42,7 @@ func (r *tokenReservation) Cancel() {
 	}
 }
 
+// NewTokenBucketLimiter creates a new TokenBucketLimiter with the specified rate (tokens per second) and capacity.
 func NewTokenBucketLimiter(rate float64, capacity int64) *TokenBucketLimiter {
 	tbl := &TokenBucketLimiter{
 		rate:      rate,
@@ -50,49 +51,48 @@ func NewTokenBucketLimiter(rate float64, capacity int64) *TokenBucketLimiter {
 		stopCh:    make(chan struct{}),
 		refillDur: time.Second,
 	}
-	tbl.cond = sync.NewCond(&tbl.mu)
-	tbl.Refill()
+	tbl.cond = sync.NewCond(&tbl.mu) // initialize condition variable to inform waiters when tokens are added
+	tbl.Refill()                     // start the refill goroutine
 	return tbl
 }
 
 func (tbl *TokenBucketLimiter) Allow(ctx context.Context, key string) bool {
 	select {
-	case <-ctx.Done():
+	case <-ctx.Done(): // check context first, if it's canceled, return false
 		return false
 	default:
-		tbl.mu.Lock()
+		tbl.mu.Lock() // lock to check and update tokens
 		defer tbl.mu.Unlock()
-		if tbl.capacity > 0 {
-			tbl.tokens--
+		if tbl.tokens > 0 { // if tokens available, consume one and return true
+			tbl.tokens-- // consume one token
 			return true
 		}
+		return false // no tokens available, return false
 	}
-	return false
 }
 
-func (tbl *TokenBucketLimiter) TryAcquire(key string, n int64) bool { //pick n tokens up
-	tbl.mu.Lock()
+// TryAcquire attempts to acquire n tokens without blocking.
+func (tbl *TokenBucketLimiter) TryAcquire(key string, n int64) bool { 
 	defer tbl.mu.Unlock()
-	if n <= tbl.tokens && tbl.tokens <= tbl.capacity {
-		tbl.tokens -= n
+	if n <= tbl.tokens { // if enough tokens available, consume n and return true
+		tbl.tokens -= n // consume n tokens
 		return true
 	}
-	return false
+	return false // not enough tokens, return false
 }
 
+// Reserve attempts to reserve a token, returning a Reservation indicating success and any delay.
+// It first checks the context for cancellation.
+// Then, it checks if a token is immediately available, if yes, it consumes it and returns an immediate reservation.
+// If no token is available, it estimates the delay until the next token will be available based on the refill rate and fractional accumulator.
+// If the rate is zero or negative, it treats it as unavailable and returns false.
 func (tbl *TokenBucketLimiter) Reserve(ctx context.Context, key string) (Reservation, bool) {
 	select {
 	case <-ctx.Done():
-		fmt.Println("Request timeout.")
-		res := &tokenReservation{
-			ok: false,
-			cancel: func() {
-				fmt.Println("The request can not be handled right now.")
-			},
-		}
-		return res, false
+		return nil, false
 	default:
 		tbl.mu.Lock()
+		// If token available, consume and return immediate reservation
 		if tbl.tokens > 0 {
 			tbl.tokens--
 			tbl.mu.Unlock()
@@ -102,27 +102,30 @@ func (tbl *TokenBucketLimiter) Reserve(ctx context.Context, key string) (Reserva
 			}
 			return res, true
 		}
+
+		// estimate delay until next token available based on fractional accumulator and rate
+		// If rate is zero, treat as unavailable
 		if tbl.rate <= 0 {
 			tbl.mu.Unlock()
 			return nil, false
 		}
-		remainingTokens := 1.0 - tbl.acc // We need 1 token to satisfy the request, So we check how many tokens are remaining to get that 1 token
-		if remainingTokens < 0 {
-			remainingTokens = 0
+		// calculate wait: remaining fractional to next whole token
+		remaining := 1.0 - tbl.acc
+		if remaining < 0 {
+			remaining = 0
 		}
-		waitDur := time.Duration(remainingTokens * float64(tbl.refillDur))
+		waitDur := time.Duration(remaining * float64(tbl.refillDur))
 		tbl.mu.Unlock()
 
 		res := &tokenReservation{
 			ok:    true,
 			delay: waitDur,
 			cancel: func() {
-				fmt.Println("The request has been cancelled.")
+				// no-op for now
 			},
 		}
 		return res, true
 	}
-
 }
 
 func (tbl *TokenBucketLimiter) Wait(ctx context.Context, key string) error { //block until token available using Cond or channel
