@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,14 +15,14 @@ type Limiter interface {
 }
 
 type Stats struct {
-	Allowed    uint64
-	Denied     uint64
-	Pending    uint64
-	LastRefill time.Time
+	Allowed    atomic.Uint64
+	Denied     atomic.Uint64
+	Pending    atomic.Uint64
+	LastRefill atomic.Pointer[time.Time]
 }
 
 type Reservation interface {
 	OK() bool
-	Cancel() 
+	Cancel()
 	Delay() time.Duration // how long caller should wait before proceeding
 }
