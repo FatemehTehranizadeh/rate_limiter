@@ -239,15 +239,13 @@ func (lbl *LeakyBucketLimiter) Stats(key string) *Stats {
 	return &s
 }
 
-func (lbl *LeakyBucketLimiter) Close() error { //stop refill goroutine, broadcast cond.
+func (lbl *LeakyBucketLimiter) Close() error {
 	lbl.mu.Lock()
-	if lbl.closed {
-		lbl.mu.Unlock()
-		return nil
+	defer lbl.mu.Unlock()
+	if !lbl.closed {
+		close(lbl.stopCh)
+		lbl.closed = true
 	}
-	lbl.closed = true
-	close(lbl.stopCh)
-	lbl.cond.Broadcast()
-	lbl.mu.Unlock()
+	lbl.cond.Broadcast() // wake up any waiters to exit
 	return nil
 }
