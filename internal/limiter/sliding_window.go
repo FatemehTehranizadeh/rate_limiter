@@ -66,8 +66,12 @@ func filterValid(timestamps []time.Time, now time.Time, window time.Duration) []
 
 // Allow tries to enqueue a request; succeeds only if within capacity in the sliding window and the request is received within the time window.
 func (swl *SlidingWindowLimiter) Allow(ctx context.Context, key string) bool {
+	stats := swl.getStats(key)
+	stats.Pending.Add(1)
+	defer stats.Pending.Add(^uint64(0)) // decrement pending count
     select {
     case <-ctx.Done():
+		stats.Denied.Add(1)
         return false
     default:
         swl.mu.Lock()
@@ -79,9 +83,10 @@ func (swl *SlidingWindowLimiter) Allow(ctx context.Context, key string) bool {
         if int64(len(valid)) < swl.capacity {
             valid = append(valid, now)
             swl.timemap[key] = valid
+			stats.Allowed.Add(1)
             return true
         }
-
+		stats.Denied.Add(1)
         swl.timemap[key] = valid
         return false
     }
@@ -90,8 +95,18 @@ func (swl *SlidingWindowLimiter) Allow(ctx context.Context, key string) bool {
 // TryAcquire attempts to add n requests to the sliding window.
 // Succeeds only if adding n does not exceed capacity.
 func (swl *SlidingWindowLimiter) TryAcquire(ctx context.Context, key string, n int) bool {
+	stats := swl.getStats(key)
+	stats.Pending.Add(uint64(n))
+	defer stats.Pending.Add(^uint64(uint64(n - 1)))
+
+	if n <= 0 {
+		stats.Denied.Add(uint64(n))
+		return false
+	}
+
     select {
     case <-ctx.Done():
+		stats.Denied.Add(uint64(n))
         return false
     default:
         swl.mu.Lock()
@@ -103,19 +118,26 @@ func (swl *SlidingWindowLimiter) TryAcquire(ctx context.Context, key string, n i
             for i := 0; i < n; i++ {
                 valid = append(valid, now)
             }
+			stats.Allowed.Add(uint64(n))
             swl.timemap[key] = valid
             return true
         }
+		stats.Denied.Add(uint64(n))
         swl.timemap[key] = valid
         return false
     }
 }
 
+
 func (swl *SlidingWindowLimiter) Wait(ctx context.Context, key string) error {
+	stats := swl.getStats(key)
+	stats.Pending.Add(1)
+	defer stats.Pending.Add(^uint64(0))
     doneCh := make(chan struct{})
     go func() {
         select {
         case <-ctx.Done():
+            stats.Denied.Add(1)
             swl.cond.Broadcast()
         case <-doneCh:
             return
@@ -135,11 +157,13 @@ func (swl *SlidingWindowLimiter) Wait(ctx context.Context, key string) error {
 
         if int64(len(valid)) < swl.capacity {
             valid = append(valid, now)
+			stats.Allowed.Add(1)
             swl.timemap[key] = valid
             return nil
         }
 
         if ctx.Err() != nil {
+			stats.Denied.Add(1)
             return ctx.Err()
         }
 
