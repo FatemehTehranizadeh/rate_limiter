@@ -158,7 +158,7 @@ func (tbl *TokenBucketLimiter) Reserve(ctx context.Context, key string) (Reserva
 // They will all block on the condition variable. When tokens are refilled, the refill goroutine broadcasts to wake them up.
 // Each waiter checks if tokens are available, if yes, it consumes one and proceeds; otherwise, it continues to wait.
 func (tbl *TokenBucketLimiter) Wait(ctx context.Context, key string) error {
-	stats := tbl.stats.getStats(key)
+	stats := tbl.getStats(key)
 	stats.Pending.Add(1)
 	defer stats.Pending.Add(^uint64(0)) // decrement pending count when done
 
@@ -189,7 +189,6 @@ func (tbl *TokenBucketLimiter) Wait(ctx context.Context, key string) error {
 
 	tbl.tokens-- // if any tokens available, consume one
 	stats.Allowed.Add(1)
-	close(doneCh)
 	return nil
 }
 
