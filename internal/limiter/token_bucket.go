@@ -242,7 +242,7 @@ func (tbl *TokenBucketLimiter) getStats(key string) *Stats {
 }
 
 
-func (tbl *LeakyBucketLimiter) Stats(key string) *Stats {
+func (tbl *TokenBucketLimiter) Stats(key string) *Stats {
 	stats := tbl.getStats(key)
 
 	var s Stats
@@ -251,20 +251,18 @@ func (tbl *LeakyBucketLimiter) Stats(key string) *Stats {
 	s.Pending.Store(stats.Pending.Load())
 	if ts := tbl.lastRefill.Load(); ts != nil {
 		s.LastRefill.Store(ts)
-	}
+	} 
 	return &s
 }
 
 // Close stops the refill goroutine and marks the limiter as closed.
 func (tbl *TokenBucketLimiter) Close() error {
 	tbl.mu.Lock()
-	if tbl.closed {
-		tbl.mu.Unlock()
-		return nil
+	defer tbl.mu.Unlock()
+	if !tbl.closed {
+		close(tbl.stopCh)
+		tbl.closed = true
 	}
-	tbl.closed = true
-	close(tbl.stopCh)
 	tbl.cond.Broadcast() // wake up any waiters to exit
-	tbl.mu.Unlock()
 	return nil
 }
