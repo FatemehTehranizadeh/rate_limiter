@@ -176,8 +176,27 @@ func (swl *SlidingWindowLimiter) Refill() {
     })
 }
 
-func (swl *SlidingWindowLimiter) Stats(key string) Stats { //uses store to read counters
-	return Stats{}
+func (swl *SlidingWindowLimiter) getStats(key string) *Stats {
+    if val, ok := swl.stats.Load(key); ok { // check if stats exist for key
+        if s, ok := val.(*Stats); ok { // type assertion. Check if val is of type *Stats
+            return s
+        }
+    }
+    s := &Stats{} // create new Stats if not found
+    swl.stats.Store(key, s) // store new Stats in map
+    return s
+}
+
+func (swl *SlidingWindowLimiter) Stats(key string) *Stats {
+	stats := swl.getStats(key)
+	var s Stats
+	s.Allowed.Store(stats.Allowed.Load())
+	s.Denied.Store(stats.Denied.Load())
+	s.Pending.Store(stats.Pending.Load())
+	if ts := swl.lastRefill.Load(); ts != nil {
+		s.LastRefill.Store(ts)
+	}
+	return &s
 }
 
 func (swl *SlidingWindowLimiter) Close() error {
